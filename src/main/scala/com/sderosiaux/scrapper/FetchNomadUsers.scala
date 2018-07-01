@@ -1,12 +1,15 @@
 package com.sderosiaux.scrapper
 
 import java.net.URI
+import java.nio.file.{FileSystem, FileSystems, Paths}
 
 import akka.NotUsed
 import akka.actor.ActorSystem
-import akka.stream.{ActorMaterializer, OverflowStrategy}
-import akka.stream.scaladsl.{Keep, Sink, Source, SourceQueueWithComplete}
+import akka.http.scaladsl.model.Uri.Path
+import akka.stream.{ActorMaterializer, IOResult, OverflowStrategy, QueueOfferResult}
+import akka.stream.scaladsl.{FileIO, Keep, Sink, Source, SourceQueueWithComplete}
 import akka.util.ByteString
+import cats.effect.IO.{Async, Bind, ContextSwitch, Delay, Map, Pure, RaiseError, Suspend}
 import cats.effect.{Bracket, ExitCode, IO, IOApp}
 import com.softwaremill.sttp._
 import com.softwaremill.sttp.akkahttp.AkkaHttpBackend
@@ -26,32 +29,21 @@ final case class AkkaStuff(system: ActorSystem, backend: SttpBackend[Future, Sou
 final case class TinyUser(username: String) extends AnyVal
 final case class Nomad(
                 username: String,
+                photo: String,
                 following: List[String],
                 followers: List[String]
                 )
-
-object Hallo extends App {
-
-  implicit val as = ActorSystem()
-  implicit val mat = ActorMaterializer()
-  implicit val ec = as.dispatcher
-
-  val (queue: SourceQueueWithComplete[Int], done) = Source.queue[Int](100, OverflowStrategy.backpressure)
-    .mapAsync(10)(s => {
-      if (s < 100000) queue.offer(s + 1) else queue.complete()
-      Future.successful(s)
-    })
-    .toMat(Sink.foreach(println(_)))(Keep.both)
-    .run()
-
-    done.onComplete { _ => as.terminate() }
-
-    queue.offer(1) // start the process
+final case class NomadExport(
+                              username: String,
+                              photo: String,
+                              followers: List[String]
+                            )
+object NomadExport {
+  import io.scalaland.chimney.dsl._
+  def fromNomad(n: Nomad) = n.into[NomadExport].transform
 }
 
-object FetchNomadUsers extends IOApp {
-  val fetchedUsers = collection.mutable.ListBuffer[String]()
-
+object Nomad {
   implicit val tinyUserDecoder: Decoder[TinyUser] = deriveDecoder
   //implicit val nomadDecoder: Decoder[Nomad] = deriveDecoder
   implicit val nomadDecoder: Decoder[Nomad] = (c: HCursor) => {
@@ -66,29 +58,29 @@ object FetchNomadUsers extends IOApp {
     // where is the decodingFailure ???
 
     for {
-      username <- c.downField("username").as[String]
+      username <- c.downField("username").as[String].map(_.substring(1)) // "@"
+      photo <- c.downField("photo").as[String]
       following <- Either.fromOption(c.focus.map(following.getAll), DecodingFailure("boom", List()))
       followers <- Either.fromOption(c.focus.map(followers.getAll), DecodingFailure("boom", List()))
-    } yield Nomad(username, following, followers)
+    } yield Nomad(username, photo, following, followers)
   }
+
+  def fromJson(str: String): Either[Throwable, Nomad] = {
+    decode[Nomad](str).leftMap(_.fillInStackTrace())
+  }
+}
+
+object FetchNomadUsers extends IOApp {
+
+
+
+  implicit val nomadExportEncoder: Encoder[NomadExport] = deriveEncoder
 
   def userUrl(username: String): Uri = uri"https://nomadlist.com/@$username.json"
-  val initialUrl: Uri = userUrl("mrty") // levelsio
+  val initialUser: String = "mrty"
+  val initialUrl: Uri = userUrl(initialUser) // levelsio
 
-  def parseJson(str: String): Unit = {
-    val nomad = decode[Nomad](str)
-    nomad match {
-      case Left(value) =>
-      case Right(value) =>
-        fetchedUsers += value.username
-        println(value.username, value.followers.length, value.following.length)
-    }
-  }
 
-  def process(res: Source[ByteString, Any])(implicit mat: ActorMaterializer): IO[Unit] = {
-    val eventualDone = res.fold("")((res, bs) => res + bs.decodeString("UTF-8"))
-    IO.fromFuture(IO.pure(eventualDone.runForeach(parseJson))) *> IO.unit
-  }
 
   override def run(args: List[String]): IO[ExitCode] = {
     val as = ActorSystem("FetchNomadUsers")
@@ -101,27 +93,83 @@ object FetchNomadUsers extends IOApp {
       .bracket(startLookup(_, initialUrl))(as => (IO.fromFuture(IO(as.system.terminate())) *> IO(as.backend.close())).void)
   }
 
-  def lookup(as: AkkaStuff, uri: Uri): IO[Unit] = {
+  def lookupUser(as: AkkaStuff, username: String): Future[Either[Throwable, Nomad]] = {
     implicit val bck = as.backend
     implicit val mat = as.mat
+    implicit val ec = as.system.dispatcher
 
-    def doCall: Future[Response[Source[ByteString, Any]]] = sttp.get(uri)
-      .response(asStream[Source[ByteString, Any]])
+    def doCall: Future[Response[String]] = sttp.get(userUrl(username))
+      .response(asString)
       .send()
 
-    for {
-      r <- IO.fromFuture(IO(doCall))
-      ex <- r.body match {
-        case Left(msg) => IO.raiseError(new Throwable(msg))
-        case Right(res) => process(res)
-      }
-    } yield ex
+    doCall.map(_.body
+      .leftMap(new Throwable(_))
+      .flatMap(Nomad.fromJson)
+    )
   }
 
+  var qq: SourceQueueWithComplete[String] = _
+
   def startLookup(as: AkkaStuff, uri: Uri): IO[ExitCode] = {
-    lookup(as, uri).attempt.flatMap {
-      case Left(value) => IO(println(s"ERR: ${value.getMessage}")).as(ExitCode.Error)
-      case Right(_) => IO.pure(ExitCode.Success)
+
+    implicit val mat = as.mat
+    implicit val ec = as.system.dispatcher
+
+    val sink: Sink[ByteString, Future[IOResult]] = FileIO.toPath(Paths.get("nomads.json"))
+
+    def createSet[T]() = {
+      import scala.collection.JavaConverters._
+      java.util.Collections.newSetFromMap(
+        new java.util.concurrent.ConcurrentHashMap[T, java.lang.Boolean]).asScala
     }
+
+    val (queue: SourceQueueWithComplete[String], done) = Source.queue[String](100000000, OverflowStrategy.backpressure)
+      .mapMaterializedValue(q => { qq = q; q })
+      .mapAsync(5)(lookupUser(as, _))
+      .collect { case Right(user) => user }
+      .statefulMapConcat { () =>
+        val fetchedUsers = createSet[String]()
+        val allUsers = createSet[String]()
+        fetchedUsers += initialUser
+        allUsers += initialUser
+
+        nomad => {
+          println("fetched: " + nomad.username)
+          val toQueue = nomad.following ++ nomad.followers
+          allUsers ++= toQueue
+          val rest = toQueue.toSet.diff(fetchedUsers)
+          if (rest.isEmpty) {
+//            if ((allUsers -- fetchedUsers).isEmpty) {
+//              qq.complete() // need a way to quit properly when we visit every user
+//            }
+          } else {
+            rest.foreach { username =>
+              fetchedUsers += username
+              qq.offer(username).onComplete {
+                case Success(s: QueueOfferResult) => println("queued:" + s)
+                case Failure(ex) => println("ERR?", ex)
+              }
+            }
+          }
+          List(nomad)
+        }
+      }
+      .map(NomadExport.fromNomad)
+      .map(n => ByteString.fromString(n.asJson.toString()))
+      .intersperse(ByteString.fromString("["), ByteString.fromString(", "), ByteString.fromString("]"))
+      .toMat(sink)(Keep.both)
+      .run()
+
+    done.onComplete { _ => as.system.terminate() }
+
+    val exit = IO.fromFuture(IO.pure(done)).attempt.map {
+      case Left(_) => ExitCode.Error
+      case Right(_) => ExitCode.Success
+    }
+
+    // START!
+    queue.offer(initialUser)
+
+    exit
   }
 }
