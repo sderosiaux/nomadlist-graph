@@ -85,9 +85,9 @@ object FetchNomadUsers extends IOApp {
     }
   }
 
-  def process(res: Source[ByteString, Any])(implicit mat: ActorMaterializer) = {
+  def process(res: Source[ByteString, Any])(implicit mat: ActorMaterializer): IO[Unit] = {
     val eventualDone = res.fold("")((res, bs) => res + bs.decodeString("UTF-8"))
-    IO.fromFuture(IO.pure(eventualDone.runForeach(parseJson)))
+    IO.fromFuture(IO.pure(eventualDone.runForeach(parseJson))) *> IO.unit
   }
 
   override def run(args: List[String]): IO[ExitCode] = {
@@ -101,7 +101,7 @@ object FetchNomadUsers extends IOApp {
       .bracket(startLookup(_, initialUrl))(as => (IO.fromFuture(IO(as.system.terminate())) *> IO(as.backend.close())).void)
   }
 
-  def startLookup(as: AkkaStuff, uri: Uri): IO[ExitCode] = {
+  def lookup(as: AkkaStuff, uri: Uri): IO[Unit] = {
     implicit val bck = as.backend
     implicit val mat = as.mat
 
@@ -112,9 +112,16 @@ object FetchNomadUsers extends IOApp {
     for {
       r <- IO.fromFuture(IO(doCall))
       ex <- r.body match {
-        case Left(msg) => IO(println(s"ERR: $msg")).as(ExitCode.Error)
-        case Right(res) => process(res).as(ExitCode.Success)
+        case Left(msg) => IO.raiseError(new Throwable(msg))
+        case Right(res) => process(res)
       }
     } yield ex
+  }
+
+  def startLookup(as: AkkaStuff, uri: Uri): IO[ExitCode] = {
+    lookup(as, uri).attempt.flatMap {
+      case Left(value) => IO(println(s"ERR: ${value.getMessage}")).as(ExitCode.Error)
+      case Right(_) => IO.pure(ExitCode.Success)
+    }
   }
 }
